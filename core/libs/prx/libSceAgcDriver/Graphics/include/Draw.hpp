@@ -25,7 +25,8 @@ struct DrawTraceContext {
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, const std::vector<std::uint32_t>* contentKey = nullptr);
+struct PreparedAhead;
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, const std::vector<std::uint32_t>* contentKey = nullptr, PreparedAhead* ahead = nullptr);
 std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 
 struct PixelFunctionLdsLayouts {
@@ -151,6 +152,26 @@ std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
 bool DrawPipelineEnabled();
+
+struct PreparedAhead {
+    std::uint64_t indexBytes = 0;
+    std::uint32_t maxIndex = 0;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+    bool validateMemoized = false;
+    bool validateHit = false;
+    VertexInputLayout vertexInput;
+    std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    std::pair<std::uint64_t, std::uint64_t> indexRange{0, 0};
+    std::uint64_t generation = 0;
+    std::uint64_t registry = 0;
+    std::uint64_t forget = 0;
+    VkDevice device = VK_NULL_HANDLE;
+    bool pendingGpuWrite = false;
+    bool deviceChanged = false;
+};
+std::shared_ptr<PreparedAhead> PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+bool DrawPrepareAhead();
 bool CommitTrims();
 
 }

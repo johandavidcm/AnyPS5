@@ -283,6 +283,53 @@ unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
 
+namespace {
+struct PrepareAheadTotals {
+    std::atomic<std::uint64_t> prepared{0};
+    std::atomic<std::uint64_t> adopted{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::PrepareAheadRedo::Count)> redone{};
+    DrawPipeline::PrepareAheadCounts reported;
+};
+
+PrepareAheadTotals& PrepareAheadStats() {
+    static PrepareAheadTotals totals;
+    return totals;
+}
+}
+
+DrawPipeline::PrepareAheadCounts DrawPipeline::PrepareAhead() {
+    auto& totals = PrepareAheadStats();
+    PrepareAheadCounts counts;
+    counts.prepared = totals.prepared.load(std::memory_order_relaxed);
+    counts.adopted = totals.adopted.load(std::memory_order_relaxed);
+    counts.refused = totals.refused.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < counts.redone.size(); ++i) counts.redone[i] = totals.redone[i].load(std::memory_order_relaxed);
+    return counts;
+}
+
+void DrawPipeline::CountPrepareAhead(PrepareAheadEvent event) {
+    auto& totals = PrepareAheadStats();
+    (event == PrepareAheadEvent::Prepared ? totals.prepared : event == PrepareAheadEvent::Adopted ? totals.adopted : totals.refused).fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawPipeline::CountPrepareAheadRedo(PrepareAheadRedo reason) {
+    PrepareAheadStats().redone[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* DrawPipeline::PrepareAheadRedoName(PrepareAheadRedo reason) {
+    switch (reason) {
+        case PrepareAheadRedo::Registry: return "registry";
+        case PrepareAheadRedo::Forget: return "forget";
+        case PrepareAheadRedo::QueuedWrite: return "queued write";
+        case PrepareAheadRedo::CpuWrite: return "cpu write";
+        case PrepareAheadRedo::PendingGpuWrite: return "pending gpu write";
+        case PrepareAheadRedo::Device: return "device";
+        case PrepareAheadRedo::Count: break;
+    }
+    return "?";
+}
+
 void DrawPipeline::rethrowFailure() {
     if (failure == nullptr) return;
     auto error = std::exchange(failure, nullptr);
@@ -365,6 +412,21 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
     drainText += reads;
+    {
+        auto& totals = PrepareAheadStats();
+        const auto current = PrepareAhead();
+        char ahead[128];
+        std::snprintf(ahead, sizeof(ahead), "; prepared ahead %llu, adopted %llu, refused %llu, redone:", static_cast<unsigned long long>(current.prepared - totals.reported.prepared), static_cast<unsigned long long>(current.adopted - totals.reported.adopted), static_cast<unsigned long long>(current.refused - totals.reported.refused));
+        drainText += ahead;
+        for (std::size_t i = 0; i < current.redone.size(); ++i) {
+            const auto count = current.redone[i] - totals.reported.redone[i];
+            if (count == 0) continue;
+            char item[64];
+            std::snprintf(item, sizeof(item), " %s %llu", PrepareAheadRedoName(static_cast<PrepareAheadRedo>(i)), static_cast<unsigned long long>(count));
+            drainText += item;
+        }
+        totals.reported = current;
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};

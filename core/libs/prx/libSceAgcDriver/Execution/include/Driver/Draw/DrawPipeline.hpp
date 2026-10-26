@@ -38,6 +38,18 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
+    enum class PrepareAheadRedo : std::uint8_t { Registry, Forget, QueuedWrite, CpuWrite, PendingGpuWrite, Device, Count };
+    enum class PrepareAheadEvent : std::uint8_t { Prepared, Adopted, Refused };
+    struct PrepareAheadCounts {
+        std::uint64_t prepared = 0;
+        std::uint64_t adopted = 0;
+        std::uint64_t refused = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(PrepareAheadRedo::Count)> redone{};
+    };
+    static PrepareAheadCounts PrepareAhead();
+    static const char* PrepareAheadRedoName(PrepareAheadRedo reason);
+    static void CountPrepareAhead(PrepareAheadEvent event);
+    static void CountPrepareAheadRedo(PrepareAheadRedo reason);
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);

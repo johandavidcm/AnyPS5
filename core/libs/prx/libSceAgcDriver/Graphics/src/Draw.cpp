@@ -1305,7 +1305,9 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, PreparedAhead* ahead = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1351,6 +1353,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (ahead != nullptr) {
+        inputs.fragmentOutputs = ahead->fragmentOutputs;
+        inputs.shaderStages = ahead->shaderStages;
+        outcome.validateMemoized = ahead->validateMemoized;
+        outcome.validateHit = ahead->validateHit;
     } else {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
@@ -1467,15 +1474,19 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
+        if (ahead != nullptr && context.recorder != nullptr && context.recorder->PendingWriteOverlaps(draw.indexAddress, static_cast<std::size_t>(indexBytes))) {
+            ahead->pendingGpuWrite = true;
+            ahead = nullptr;
+        }
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
-            highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            highest = ahead != nullptr ? ahead->maxIndex : InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
-            highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
+            highest = ahead != nullptr ? ahead->maxIndex : HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
             highest = copy.derived;
@@ -1486,7 +1497,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
-        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
         if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
@@ -1525,6 +1535,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
         inputs.vertexInput = recipe->vertexInput;
+    } else if (ahead != nullptr) {
+        inputs.retainedVertexInput = ahead->retainedVertexInput;
+        if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = ahead->vertexInput;
     } else if (!attributes.empty()) {
         if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
@@ -2469,6 +2482,7 @@ struct PreparedDraw {
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     const std::vector<std::uint32_t>* contentKey = nullptr;
+    PreparedAhead* ahead = nullptr;
     std::vector<std::uint32_t> stencilReferences;
     std::optional<PerformanceTimer> timing;
     DrawTimer timer;
@@ -2547,7 +2561,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.ahead);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -3253,13 +3267,18 @@ std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const 
     return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, const std::vector<std::uint32_t>* contentKey) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, const std::vector<std::uint32_t>* contentKey, PreparedAhead* ahead) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PreparedDraw prepared(profile);
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.contentKey = contentKey;
+    if (ahead != nullptr && ahead->device != context.device) {
+        ahead->deviceChanged = true;
+        ahead = nullptr;
+    }
+    prepared.ahead = ahead;
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
 }
 
@@ -3458,6 +3477,55 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         }
         storeClearTexels(context, color, texel);
     }
+}
+
+std::shared_ptr<PreparedAhead> PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    if (draw.indirect || state.stages.mesh || state.stages.tessellation || state.quadList || StripPatches(state, shaders) || draw.indexCount == 0 || draw.instanceCount == 0) return nullptr;
+    if (shaders.empty() || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program == nullptr || !shader.program->stencilReferences.empty(); })) return nullptr;
+    if (draw.indexed ? (draw.flags != 0 || (draw.indexSize != 2 && draw.indexSize != 4)) : ((draw.flags & ~0x20u) != 0 || draw.indexAddress != 0 || draw.indexSize != 0)) return nullptr;
+    auto ahead = std::make_shared<PreparedAhead>();
+    ahead->device = context.device;
+    ahead->registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    ahead->forget = GuestMemory::ForgetSerial();
+    ahead->indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    try {
+        if (draw.indexed) {
+            if (ahead->indexBytes > std::numeric_limits<std::size_t>::max()) return nullptr;
+            const auto bytes = static_cast<std::size_t>(ahead->indexBytes);
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), bytes, draw.indexSize);
+            ahead->generation = GuestMemory::CollectWrites(draw.indexAddress, bytes);
+            if (ahead->generation == 0) return nullptr;
+            const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart);
+            const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(draw.indexAddress), bytes);
+            const auto highest = HighestDrawIndex(range, draw.indexSize, skipRestart);
+            if (!highest) return nullptr;
+            if (const auto zeroFrom = ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
+                const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
+                if (*highest >= limit && *highest - limit >= ZeroFetchSlack) return nullptr;
+            }
+            ahead->maxIndex = *highest;
+            ahead->indexRange = {draw.indexAddress, draw.indexAddress + ahead->indexBytes};
+        } else {
+            if (draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return nullptr;
+            ahead->maxIndex = draw.firstVertex + draw.indexCount - 1u;
+        }
+        ahead->fragmentOutputs = CachedFragmentOutputs(context, shaders, state, ahead->validateMemoized, ahead->validateHit);
+        ahead->shaderStages = PipelineStages(shaders);
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        if (!attributes.empty()) {
+            if (context.vertexInputs != nullptr) ahead->retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+            if (ahead->retainedVertexInput == nullptr) ahead->vertexInput = BuildVertexInputLayout(context, attributes);
+        }
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+    return ahead;
+}
+
+bool DrawPrepareAhead() {
+    static const bool enabled = std::getenv("APS5_DRAW_PREPARE_AHEAD") != nullptr;
+    return enabled;
 }
 
 bool DrawPipelineEnabled() {
