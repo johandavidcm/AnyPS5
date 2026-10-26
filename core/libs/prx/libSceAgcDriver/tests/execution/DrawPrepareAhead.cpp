@@ -43,6 +43,7 @@ namespace {
 
 using AgcDriver::Graphics::Require;
 using AgcDriver::DriverDetail::DrawPipeline;
+using AgcDriver::DriverDetail::DrawPreparer;
 using Redo = DrawPipeline::PrepareAheadRedo;
 
 constexpr std::byte Kept{0x40};
@@ -281,6 +282,16 @@ void DrawDirect(const Target& target, const std::string& what) {
     Require(covered != 0 && covered != target.bytes.size(), what + ": the direct draw covered " + std::to_string(covered) + " of " + std::to_string(target.bytes.size()) + " bytes, expected an edge through the target");
 }
 
+void WaitForThePreparer(const DrawPipeline::PrepareAheadCounts& before) {
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        const auto now = DrawPipeline::PrepareAhead();
+        if (now.prepared + now.refused != before.prepared + before.refused) return;
+        Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), "the draw preparer never prepared the queued draw");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 struct Window {
     DrawPipeline::PrepareAheadCounts counts;
     std::uint64_t lookups = 0;
@@ -299,6 +310,7 @@ Window QueuedIndexedDraw(const Target& target, std::uint16_t second, bool label,
     const auto lookupsBefore = PipelineLookups();
     Blocker blocker;
     SubmitBehindTheBlocker(blocker, commands, label ? 3u : 2u);
+    WaitForThePreparer(before);
     during();
     blocker.Release();
     Finish();
@@ -350,6 +362,38 @@ void QueuedLabelWriteInTheWindow() {
     ExpectWindow(before, window, 1, std::nullopt, 1, "a queued write over the index range");
 }
 
+void NotReadyDrawIsRedone() {
+    const auto target = Resident(5);
+    auto held = std::make_shared<std::atomic<bool>>(true);
+    Require(DrawPreparer::Get().Enqueue([held] {
+        while (held->load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }), "the draw preparer refused the job that holds it");
+    Fill(target);
+    SetIndices(0, 1, 2);
+    std::vector<std::uint32_t> commands;
+    AppendState(commands);
+    AppendTarget(commands, target);
+    AppendIndexedDraw(commands);
+    const auto before = DrawPipeline::PrepareAhead();
+    const auto lookupsBefore = PipelineLookups();
+    Blocker blocker;
+    SubmitBehindTheBlocker(blocker, commands, 2);
+    blocker.Release();
+    Finish();
+    blocker.Join();
+    Flush(target);
+    const auto committed = DrawPipeline::PrepareAhead();
+    held->store(false);
+    DrawPreparer::Get().Settle();
+    const auto after = DrawPipeline::PrepareAhead();
+    const auto lookups = PipelineLookups() - lookupsBefore;
+    Same(target, Resident(0), "the draw committed before the preparer reached it");
+    const auto notReady = static_cast<std::size_t>(Redo::NotReady);
+    Require(committed.redone[notReady] - before.redone[notReady] == 1 && committed.prepared == before.prepared, "the committer did not count the draw as not ready while the preparer was held:" + Describe(before, committed));
+    ExpectCounts(before, after, 1, 0, Redo::NotReady, "a draw the committer reached before the preparer");
+    Require(lookups == 2, "the draw committed before its preparation looked its pipeline up " + std::to_string(lookups) + " times, expected 2 (the committer's, then the late preparation's)");
+}
+
 void NotRecordedDrawIsRedone() {
     const auto target = Linear(LinearQueuedMemory);
     const auto before = DrawPipeline::PrepareAhead();
@@ -384,6 +428,7 @@ int main() {
         RegistryChangeInTheWindow();
         QueuedLabelWriteInTheWindow();
         NotRecordedDrawIsRedone();
+        NotReadyDrawIsRedone();
         AgcDriverShutdown_nid_postfix();
         std::puts("draw prepare ahead tests passed");
         return 0;

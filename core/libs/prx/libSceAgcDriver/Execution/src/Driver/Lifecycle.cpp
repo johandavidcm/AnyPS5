@@ -170,8 +170,10 @@ void Driver::stop() {
     } catch (...) {
     }
     DrawPipeline::Queue0().Stop();
+    DrawPreparer::Get().Settle();
     DrawPipeline::Queue0().ReleaseRetired();
     DrawFinisher::Get().ReleaseRan();
+    DrawPreparer::Get().ReleaseRan();
     StopWorkerSampler();
     CloseRegistrationPreparation();
     Graphics::StopPipelineLibraryWorker();
