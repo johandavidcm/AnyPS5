@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -32,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -45,21 +47,36 @@ using Redo = DrawPipeline::PrepareAheadRedo;
 
 constexpr std::byte Kept{0x40};
 constexpr std::uint32_t BaseVertexLocation = 0x8c;
-constexpr std::size_t IndexBlockBytes = 65536;
+constexpr std::size_t BlockBytes = 65536;
+constexpr std::size_t TargetBytes = 65536;
+constexpr std::size_t LinearTargetBytes = 1024;
+constexpr std::uint32_t LinearAttrib3 = 0x9000000u;
+constexpr std::uint32_t RenderTargetAttrib3 = 0x9000000u | (0x1bu << 14u);
+constexpr std::size_t ResidentTargets = 6;
 
 alignas(256) constexpr std::array<std::uint32_t, 20> VertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
     0x7e060208u, 0x7e0802f2u, 0x7e0a02ffu, 0x44800000u, 0xf80000d1u, 0x00000005u, 0xf80008cfu, 0x04030201u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
-alignas(256) std::array<std::byte, 1024> DirectMemory{};
-alignas(256) std::array<std::byte, 1024> IndexedMemory{};
-alignas(256) std::array<std::byte, 1024> CpuWindowMemory{};
-alignas(256) std::array<std::byte, 1024> AdoptedMemory{};
-alignas(256) std::array<std::byte, 1024> LabelWindowMemory{};
-alignas(256) std::array<std::byte, 1024> RegistryMemory{};
+alignas(256) std::array<std::byte, LinearTargetBytes> LinearDirectMemory{};
+alignas(256) std::array<std::byte, LinearTargetBytes> LinearQueuedMemory{};
 alignas(4096) std::array<std::byte, 4096> SpareMemory{};
 std::uint16_t* Indices = nullptr;
+std::byte* Targets = nullptr;
+
+struct Target {
+    std::span<std::byte> bytes;
+    std::uint32_t attrib3 = LinearAttrib3;
+};
+
+Target Linear(std::array<std::byte, LinearTargetBytes>& memory) {
+    return {std::span<std::byte>(memory), LinearAttrib3};
+}
+
+Target Resident(std::size_t index) {
+    return {std::span<std::byte>(Targets + index * TargetBytes, TargetBytes), RenderTargetAttrib3};
+}
 
 struct Header {
     Shader shader{};
@@ -80,22 +97,22 @@ void Registered(Header& header, const std::uint32_t* code, std::size_t bytes, st
     AgcDriverRegisterShader_nid_postfix(&header.shader);
 }
 
-void AllocateIndices() {
+std::byte* GuestBlock(std::size_t bytes) {
 #ifdef _WIN32
-    auto* block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(IndexBlockBytes, IndexBlockBytes));
-    Require(block != nullptr, "cannot reserve the index block in the guest arena");
-    GuestArena::GuestArenaCommit_nid_postfix(block, IndexBlockBytes, PAGE_READWRITE, IndexBlockBytes);
+    auto* block = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, BlockBytes));
+    Require(block != nullptr, "cannot reserve a block in the guest arena");
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
-    void* mapped = mmap(nullptr, IndexBlockBytes * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    Require(mapped != MAP_FAILED, "cannot map the index block");
+    void* mapped = mmap(nullptr, bytes + BlockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(mapped != MAP_FAILED, "cannot map a guest block");
     const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
-    auto* block = reinterpret_cast<std::uint8_t*>((begin + IndexBlockBytes - 1) & ~(static_cast<std::uintptr_t>(IndexBlockBytes) - 1));
-    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, IndexBlockBytes);
+    auto* block = reinterpret_cast<std::byte*>((begin + BlockBytes - 1) & ~(static_cast<std::uintptr_t>(BlockBytes) - 1));
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
 #endif
-    std::memset(block, 0, IndexBlockBytes);
-    GuestAllocations::Mutation().Add(block, IndexBlockBytes, true, true, true);
-    Require(AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uint64_t>(block), IndexBlockBytes), "the index block is not write-watched");
-    Indices = reinterpret_cast<std::uint16_t*>(block);
+    std::memset(block, 0, bytes);
+    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+    Require(AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uint64_t>(block), bytes), "the guest block is not write-watched");
+    return block;
 }
 
 void SetIndices(std::uint16_t first, std::uint16_t second, std::uint16_t third) {
@@ -122,7 +139,7 @@ void AppendState(std::vector<std::uint32_t>& commands) {
         {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
         {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
         {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
-        {0x3b8, 0x9000000}, {0x1e0, 0},
+        {0x3b8, LinearAttrib3}, {0x1e0, 0},
         {0xc, 0}, {0xd, 0x40040},
         {0x81, 0x80000000}, {0x82, 0x40040},
         {0x90, 0x80000000}, {0x91, 0x40040},
@@ -143,10 +160,11 @@ void AppendState(std::vector<std::uint32_t>& commands) {
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
 }
 
-void AppendTarget(std::vector<std::uint32_t>& commands, std::array<std::byte, 1024>& memory) {
-    const auto color = reinterpret_cast<std::uintptr_t>(memory.data());
+void AppendTarget(std::vector<std::uint32_t>& commands, const Target& target) {
+    const auto color = reinterpret_cast<std::uintptr_t>(target.bytes.data());
     Append(commands, 0x69, {0x318, static_cast<std::uint32_t>(color >> 8u)});
     Append(commands, 0x69, {0x390, static_cast<std::uint32_t>(color >> 40u)});
+    Append(commands, 0x69, {0x3b8, target.attrib3});
     Append(commands, 0x76, {BaseVertexLocation, 0});
 }
 
@@ -161,18 +179,23 @@ void AppendLabel(std::vector<std::uint32_t>& commands, const void* target, std::
     commands.insert(commands.end(), {0xc0064900u, 0x514u, (1u << 29u) | (2u << 24u), static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), value, 0, 0});
 }
 
-std::size_t Covered(const std::array<std::byte, 1024>& memory) {
-    return static_cast<std::size_t>(std::count_if(memory.begin(), memory.end(), [](std::byte value) { return value != Kept; }));
+void Fill(const Target& target) {
+    std::fill(target.bytes.begin(), target.bytes.end(), Kept);
 }
 
-void SameAsDirect(const std::array<std::byte, 1024>& memory, const std::string& what) {
-    for (std::size_t index = 0; index < DirectMemory.size(); ++index) {
-        Require(memory[index] == DirectMemory[index], what + ": byte " + std::to_string(index) + " is " + std::to_string(static_cast<unsigned>(memory[index])) + ", the direct draw wrote " + std::to_string(static_cast<unsigned>(DirectMemory[index])));
+void Flush(const Target& target) {
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(target.bytes.data()), target.bytes.size());
+}
+
+std::size_t Covered(const Target& target) {
+    return static_cast<std::size_t>(std::count_if(target.bytes.begin(), target.bytes.end(), [](std::byte value) { return value != Kept; }));
+}
+
+void Same(const Target& target, const Target& reference, const std::string& what) {
+    Require(target.bytes.size() == reference.bytes.size(), what + ": the target and its reference differ in size");
+    for (std::size_t index = 0; index < reference.bytes.size(); ++index) {
+        Require(target.bytes[index] == reference.bytes[index], what + ": byte " + std::to_string(index) + " is " + std::to_string(static_cast<unsigned>(target.bytes[index])) + ", the direct draw wrote " + std::to_string(static_cast<unsigned>(reference.bytes[index])));
     }
-}
-
-void Flush(const std::array<std::byte, 1024>& memory) {
-    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(memory.data()), memory.size());
 }
 
 struct Blocker {
@@ -224,8 +247,13 @@ void SubmitBehindTheBlocker(Blocker& blocker, std::vector<std::uint32_t>& comman
     }
 }
 
+std::uint64_t PipelineLookups() {
+    const auto totals = AgcDriver::Graphics::PipelineStoreTotals();
+    return totals.hits + totals.misses + totals.uncached;
+}
+
 std::string Describe(const DrawPipeline::PrepareAheadCounts& before, const DrawPipeline::PrepareAheadCounts& after) {
-    std::string text = " prepared " + std::to_string(after.prepared - before.prepared) + ", adopted " + std::to_string(after.adopted - before.adopted) + ", refused " + std::to_string(after.refused - before.refused) + ", redone:";
+    std::string text = " prepared " + std::to_string(after.prepared - before.prepared) + ", adopted " + std::to_string(after.adopted - before.adopted) + ", refused " + std::to_string(after.refused - before.refused) + ", unused " + std::to_string(after.unused - before.unused) + ", redone:";
     for (std::size_t reason = 0; reason < after.redone.size(); ++reason) text += " " + std::string(DrawPipeline::PrepareAheadRedoName(static_cast<Redo>(reason))) + " " + std::to_string(after.redone[reason] - before.redone[reason]);
     return text;
 }
@@ -239,113 +267,95 @@ void ExpectCounts(const DrawPipeline::PrepareAheadCounts& before, const DrawPipe
     }
 }
 
-void DrawDirectReference() {
-    DirectMemory.fill(Kept);
+void DrawDirect(const Target& target, const std::string& what) {
+    Fill(target);
     std::vector<std::uint32_t> commands;
     AppendState(commands);
-    AppendTarget(commands, DirectMemory);
+    AppendTarget(commands, target);
     Append(commands, 0x2d, {3, 2});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
-    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the direct draw submission failed");
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, what + ": the direct draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
-    Flush(DirectMemory);
-    const auto direct = Covered(DirectMemory);
-    Require(direct != 0 && direct != DirectMemory.size(), "the direct draw covered " + std::to_string(direct) + " of " + std::to_string(DirectMemory.size()) + " bytes, expected an edge through the target");
+    Flush(target);
+    const auto covered = Covered(target);
+    Require(covered != 0 && covered != target.bytes.size(), what + ": the direct draw covered " + std::to_string(covered) + " of " + std::to_string(target.bytes.size()) + " bytes, expected an edge through the target");
 }
 
-void IndexedDrawMatchesTheDirectOne() {
-    IndexedMemory.fill(Kept);
-    SetIndices(0, 1, 2);
+struct Window {
+    DrawPipeline::PrepareAheadCounts counts;
+    std::uint64_t lookups = 0;
+};
+
+template <typename During>
+Window QueuedIndexedDraw(const Target& target, std::uint16_t second, bool label, During during) {
+    Fill(target);
+    SetIndices(0, second, 2);
     std::vector<std::uint32_t> commands;
     AppendState(commands);
-    AppendTarget(commands, IndexedMemory);
+    if (label) AppendLabel(commands, Indices, 0x00010000u);
+    AppendTarget(commands, target);
     AppendIndexedDraw(commands);
-    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
-    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the indexed draw submission failed");
-    AgcDriverWaitIdle_nid_postfix();
-    Flush(IndexedMemory);
-    SameAsDirect(IndexedMemory, "the indexed draw of the three vertices");
+    const auto before = DrawPipeline::PrepareAhead();
+    const auto lookupsBefore = PipelineLookups();
+    Blocker blocker;
+    SubmitBehindTheBlocker(blocker, commands, label ? 3u : 2u);
+    during();
+    blocker.Release();
+    Finish();
+    blocker.Join();
+    Flush(target);
+    const auto after = DrawPipeline::PrepareAhead();
+    Window window;
+    window.lookups = PipelineLookups() - lookupsBefore;
+    window.counts = after;
+    return window;
+}
+
+void ExpectWindow(const DrawPipeline::PrepareAheadCounts& before, const Window& window, std::uint64_t adopted, std::optional<Redo> redone, std::uint64_t lookups, const std::string& what) {
+    ExpectCounts(before, window.counts, 1, adopted, redone, what);
+    Require(window.lookups == lookups, what + ": the draw looked its pipeline up " + std::to_string(window.lookups) + " times, expected " + std::to_string(lookups));
+}
+
+void ResidentDrawIsAdopted() {
+    const auto target = Resident(1);
+    const auto before = DrawPipeline::PrepareAhead();
+    const auto window = QueuedIndexedDraw(target, 1, false, [] {});
+    Same(target, Resident(0), "the draw prepared ahead and adopted");
+    ExpectWindow(before, window, 1, std::nullopt, 1, "a draw into a resident target whose inputs nobody wrote while it was queued");
 }
 
 void CpuWriteInTheWindow() {
-    CpuWindowMemory.fill(Kept);
-    SetIndices(0, 0, 2);
-    std::vector<std::uint32_t> commands;
-    AppendState(commands);
-    AppendTarget(commands, CpuWindowMemory);
-    AppendIndexedDraw(commands);
+    const auto target = Resident(2);
     const auto before = DrawPipeline::PrepareAhead();
-    Blocker blocker;
-    SubmitBehindTheBlocker(blocker, commands, 2);
-    SetIndices(0, 1, 2);
-    blocker.Release();
-    Finish();
-    blocker.Join();
-    Flush(CpuWindowMemory);
-    const auto after = DrawPipeline::PrepareAhead();
-    SameAsDirect(CpuWindowMemory, "the draw whose indices the CPU wrote while it was queued");
-    ExpectCounts(before, after, 1, 0, Redo::CpuWrite, "a CPU write into the index range while the draw was queued");
-}
-
-void PreparedDrawIsAdopted() {
-    AdoptedMemory.fill(Kept);
-    SetIndices(0, 1, 2);
-    std::vector<std::uint32_t> commands;
-    AppendState(commands);
-    AppendTarget(commands, AdoptedMemory);
-    AppendIndexedDraw(commands);
-    const auto before = DrawPipeline::PrepareAhead();
-    Blocker blocker;
-    SubmitBehindTheBlocker(blocker, commands, 2);
-    blocker.Release();
-    Finish();
-    blocker.Join();
-    Flush(AdoptedMemory);
-    const auto after = DrawPipeline::PrepareAhead();
-    SameAsDirect(AdoptedMemory, "the draw prepared ahead and adopted");
-    ExpectCounts(before, after, 1, 1, std::nullopt, "a draw whose inputs nobody wrote while it was queued");
+    const auto window = QueuedIndexedDraw(target, 0, false, [] { SetIndices(0, 1, 2); });
+    Same(target, Resident(0), "the draw whose indices the CPU wrote while it was queued");
+    ExpectWindow(before, window, 1, std::nullopt, 1, "a CPU write into the index range while the draw was queued");
 }
 
 void RegistryChangeInTheWindow() {
-    RegistryMemory.fill(Kept);
-    SetIndices(0, 1, 2);
-    std::vector<std::uint32_t> commands;
-    AppendState(commands);
-    AppendTarget(commands, RegistryMemory);
-    AppendIndexedDraw(commands);
+    const auto target = Resident(3);
     const auto before = DrawPipeline::PrepareAhead();
-    Blocker blocker;
-    SubmitBehindTheBlocker(blocker, commands, 2);
-    GuestAllocations::Mutation().Add(SpareMemory.data(), SpareMemory.size(), true, true, true);
-    blocker.Release();
-    Finish();
-    blocker.Join();
+    const auto window = QueuedIndexedDraw(target, 1, false, [] { GuestAllocations::Mutation().Add(SpareMemory.data(), SpareMemory.size(), true, true, true); });
     GuestAllocations::Mutation().Remove(SpareMemory.data());
-    Flush(RegistryMemory);
-    const auto after = DrawPipeline::PrepareAhead();
-    SameAsDirect(RegistryMemory, "the draw queued across a registry change");
-    ExpectCounts(before, after, 1, 0, Redo::Registry, "a registry change while the draw was queued");
+    Same(target, Resident(0), "the draw queued across a registry change");
+    ExpectWindow(before, window, 1, std::nullopt, 1, "a registry change while the draw was queued");
 }
 
 void QueuedLabelWriteInTheWindow() {
-    LabelWindowMemory.fill(Kept);
-    SetIndices(0, 0, 2);
-    std::vector<std::uint32_t> commands;
-    AppendState(commands);
-    AppendLabel(commands, Indices, 0x00010000u);
-    AppendTarget(commands, LabelWindowMemory);
-    AppendIndexedDraw(commands);
+    const auto target = Resident(4);
     const auto before = DrawPipeline::PrepareAhead();
-    Blocker blocker;
-    SubmitBehindTheBlocker(blocker, commands, 3);
-    blocker.Release();
-    Finish();
-    blocker.Join();
-    Flush(LabelWindowMemory);
-    const auto after = DrawPipeline::PrepareAhead();
+    const auto window = QueuedIndexedDraw(target, 0, true, [] {});
     Require(Indices[1] == 1, "the queued label did not write the second index");
-    SameAsDirect(LabelWindowMemory, "the draw whose indices a queued label wrote");
-    ExpectCounts(before, after, 1, 0, Redo::QueuedWrite, "a queued write over the index range");
+    Same(target, Resident(0), "the draw whose indices a queued label wrote");
+    ExpectWindow(before, window, 1, std::nullopt, 1, "a queued write over the index range");
+}
+
+void NotRecordedDrawIsRedone() {
+    const auto target = Linear(LinearQueuedMemory);
+    const auto before = DrawPipeline::PrepareAhead();
+    const auto window = QueuedIndexedDraw(target, 1, false, [] {});
+    Same(target, Linear(LinearDirectMemory), "the draw into a target that is not resident");
+    ExpectWindow(before, window, 0, Redo::Layout, 2, "a draw into a target that is not resident, so not recorded");
 }
 
 }
@@ -365,13 +375,15 @@ int main() {
         }
         Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
-        AllocateIndices();
-        DrawDirectReference();
-        IndexedDrawMatchesTheDirectOne();
+        Indices = reinterpret_cast<std::uint16_t*>(GuestBlock(BlockBytes));
+        Targets = GuestBlock(ResidentTargets * TargetBytes);
+        DrawDirect(Linear(LinearDirectMemory), "the linear reference");
+        DrawDirect(Resident(0), "the resident reference");
+        ResidentDrawIsAdopted();
         CpuWriteInTheWindow();
-        PreparedDrawIsAdopted();
         RegistryChangeInTheWindow();
         QueuedLabelWriteInTheWindow();
+        NotRecordedDrawIsRedone();
         AgcDriverShutdown_nid_postfix();
         std::puts("draw prepare ahead tests passed");
         return 0;

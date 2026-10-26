@@ -153,22 +153,19 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
 bool DrawPipelineEnabled();
 
+enum class PreparedAheadOutcome : std::uint8_t { Unused, Adopted, Device, Layout, SetLayouts };
 struct PreparedAhead {
-    std::uint64_t indexBytes = 0;
-    std::uint32_t maxIndex = 0;
+    VkDevice device = VK_NULL_HANDLE;
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     bool validateMemoized = false;
     bool validateHit = false;
     VertexInputLayout vertexInput;
     std::shared_ptr<const VertexInputLayout> retainedVertexInput;
-    std::pair<std::uint64_t, std::uint64_t> indexRange{0, 0};
-    std::uint64_t generation = 0;
-    std::uint64_t registry = 0;
-    std::uint64_t forget = 0;
-    VkDevice device = VK_NULL_HANDLE;
-    bool pendingGpuWrite = false;
-    bool deviceChanged = false;
+    DescribedSetLayouts setLayouts;
+    VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::shared_ptr<Pipeline> pipeline;
+    PreparedAheadOutcome outcome = PreparedAheadOutcome::Unused;
 };
 std::shared_ptr<PreparedAhead> PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 bool DrawPrepareAhead();

@@ -1,4 +1,3 @@
-#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -14,7 +13,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
-#include <optional>
 #include <atomic>
 #include <array>
 #include <algorithm>
@@ -1220,18 +1218,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
         auto contentKey = recipe == nullptr && DrawFinisher::OnFinisherThread() ? localDevice->DrawContentKey(decode->state, drawParameters, stages) : std::vector<std::uint32_t>{};
-        std::shared_ptr<AheadDraw> ahead;
+        std::shared_ptr<Graphics::PreparedAhead> ahead;
         if (recipe == nullptr && Graphics::DrawPrepareAhead()) {
-            auto watch = DrawPipeline::Queue0().WatchWrites();
-            if (auto prepared = localDevice->PrepareDrawAhead(decode->state, drawParameters, stages)) {
-                ahead = std::make_shared<AheadDraw>();
-                ahead->prepared = std::move(prepared);
-                ahead->watch = std::move(watch);
-                if (ahead->prepared->indexRange.second != ahead->prepared->indexRange.first) ahead->reads.push_back(ahead->prepared->indexRange);
-                DrawPipeline::CountPrepareAhead(DrawPipeline::PrepareAheadEvent::Prepared);
-            } else {
-                DrawPipeline::CountPrepareAhead(DrawPipeline::PrepareAheadEvent::Refused);
-            }
+            ahead = localDevice->PrepareDrawAhead(decode->state, drawParameters, stages);
+            DrawPipeline::CountPrepareAhead(ahead != nullptr ? DrawPipeline::PrepareAheadEvent::Prepared : DrawPipeline::PrepareAheadEvent::Refused);
         }
         auto commit = [this, contentKey = std::move(contentKey), ahead = std::move(ahead), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
@@ -1265,7 +1255,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, const std::vector<std::uint32_t>* contentKey, AheadDraw* ahead) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, const std::vector<std::uint32_t>* contentKey, Graphics::PreparedAhead* ahead) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -1284,24 +1274,17 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    Graphics::PreparedAhead* adopted = nullptr;
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, contentKey, ahead);
     if (ahead != nullptr) {
+        using Outcome = Graphics::PreparedAheadOutcome;
         using Redo = DrawPipeline::PrepareAheadRedo;
-        auto& prepared = *ahead->prepared;
-        const auto bytes = static_cast<std::size_t>(prepared.indexRange.second - prepared.indexRange.first);
-        std::optional<Redo> redo;
-        if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != prepared.registry) redo = Redo::Registry;
-        else if (GuestMemory::ForgetSerial() != prepared.forget) redo = Redo::Forget;
-        else if (!ahead->reads.empty() && DrawPipeline::Queue0().WrittenSince(ahead->watch, ahead->reads)) redo = Redo::QueuedWrite;
-        else if (!ahead->reads.empty() && (GuestMemory::CollectWrites(prepared.indexRange.first, bytes) == 0 || !GuestMemory::UnchangedSince(prepared.indexRange.first, bytes, prepared.generation))) redo = Redo::CpuWrite;
-        if (redo.has_value()) DrawPipeline::CountPrepareAheadRedo(*redo);
-        else adopted = &prepared;
-    }
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, contentKey, adopted);
-    if (adopted != nullptr) {
-        if (adopted->deviceChanged) DrawPipeline::CountPrepareAheadRedo(DrawPipeline::PrepareAheadRedo::Device);
-        else if (adopted->pendingGpuWrite) DrawPipeline::CountPrepareAheadRedo(DrawPipeline::PrepareAheadRedo::PendingGpuWrite);
-        else DrawPipeline::CountPrepareAhead(DrawPipeline::PrepareAheadEvent::Adopted);
+        switch (ahead->outcome) {
+            case Outcome::Adopted: DrawPipeline::CountPrepareAhead(DrawPipeline::PrepareAheadEvent::Adopted); break;
+            case Outcome::Unused: DrawPipeline::CountPrepareAhead(DrawPipeline::PrepareAheadEvent::Unused); break;
+            case Outcome::Device: DrawPipeline::CountPrepareAheadRedo(Redo::Device); break;
+            case Outcome::Layout: DrawPipeline::CountPrepareAheadRedo(Redo::Layout); break;
+            case Outcome::SetLayouts: DrawPipeline::CountPrepareAheadRedo(Redo::SetLayouts); break;
+        }
     }
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }

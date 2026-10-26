@@ -38,12 +38,13 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
-    enum class PrepareAheadRedo : std::uint8_t { Registry, Forget, QueuedWrite, CpuWrite, PendingGpuWrite, Device, Count };
-    enum class PrepareAheadEvent : std::uint8_t { Prepared, Adopted, Refused };
+    enum class PrepareAheadRedo : std::uint8_t { Device, Layout, SetLayouts, Count };
+    enum class PrepareAheadEvent : std::uint8_t { Prepared, Adopted, Refused, Unused };
     struct PrepareAheadCounts {
         std::uint64_t prepared = 0;
         std::uint64_t adopted = 0;
         std::uint64_t refused = 0;
+        std::uint64_t unused = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(PrepareAheadRedo::Count)> redone{};
     };
     static PrepareAheadCounts PrepareAhead();

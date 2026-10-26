@@ -1305,8 +1305,6 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
-
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, PreparedAhead* ahead = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -1474,19 +1472,15 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-        if (ahead != nullptr && context.recorder != nullptr && context.recorder->PendingWriteOverlaps(draw.indexAddress, static_cast<std::size_t>(indexBytes))) {
-            ahead->pendingGpuWrite = true;
-            ahead = nullptr;
-        }
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
-            highest = ahead != nullptr ? ahead->maxIndex : InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
-            highest = ahead != nullptr ? ahead->maxIndex : HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
+            highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
             highest = copy.derived;
@@ -1497,6 +1491,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
+        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
         if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
@@ -2444,6 +2439,11 @@ bool RecordDraws() {
     return recordDraws;
 }
 
+bool DrawTransitions() {
+    static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+    return drawTransitions;
+}
+
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
@@ -2810,8 +2810,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
-    static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
-    const bool lean = prepared.lean = recorded && !drawTransitions;
+    const bool lean = prepared.lean = recorded && !DrawTransitions();
     const bool multisampled = prepared.multisampled = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; });
     Require(lean || !multisampled, "multisampled draws are only rendered as recorded draws");
     for (const auto& binding : targets) {
@@ -2862,7 +2861,20 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
     auto& pipeline = prepared.pipeline;
-    pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    const auto attachmentLayout = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (auto* ahead = prepared.ahead; ahead != nullptr && stencilReplay.empty()) {
+        const auto layouts = resources->SetLayouts();
+        const auto& described = ahead->setLayouts;
+        if (ahead->attachmentLayout != attachmentLayout) {
+            ahead->outcome = PreparedAheadOutcome::Layout;
+        } else if (layouts.main != described.layouts.main || layouts.fragment != described.layouts.fragment || layouts.split != described.layouts.split || !std::ranges::equal(layouts.mainKey, described.mainKey) || !std::ranges::equal(layouts.fragmentKey, described.fragmentKey)) {
+            ahead->outcome = PreparedAheadOutcome::SetLayouts;
+        } else {
+            ahead->outcome = PreparedAheadOutcome::Adopted;
+            pipeline = ahead->pipeline;
+        }
+    }
+    if (pipeline == nullptr) pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, attachmentLayout) : stencilReplay.front().second;
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     auto& owners = prepared.owners;
@@ -3275,7 +3287,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.trace = trace;
     prepared.contentKey = contentKey;
     if (ahead != nullptr && ahead->device != context.device) {
-        ahead->deviceChanged = true;
+        ahead->outcome = PreparedAheadOutcome::Device;
         ahead = nullptr;
     }
     prepared.ahead = ahead;
@@ -3480,36 +3492,12 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
 }
 
 std::shared_ptr<PreparedAhead> PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
-    if (draw.indirect || state.stages.mesh || state.stages.tessellation || state.quadList || StripPatches(state, shaders) || draw.indexCount == 0 || draw.instanceCount == 0) return nullptr;
+    if (draw.indirect || state.stages.mesh || state.stages.tessellation || state.quadList || StripPatches(state, shaders) || context.descriptorCache == nullptr) return nullptr;
     if (shaders.empty() || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program == nullptr || !shader.program->stencilReferences.empty(); })) return nullptr;
-    if (draw.indexed ? (draw.flags != 0 || (draw.indexSize != 2 && draw.indexSize != 4)) : ((draw.flags & ~0x20u) != 0 || draw.indexAddress != 0 || draw.indexSize != 0)) return nullptr;
+    if (std::ranges::any_of(state.colors, [&](const auto& color) { return AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED; })) return nullptr;
     auto ahead = std::make_shared<PreparedAhead>();
     ahead->device = context.device;
-    ahead->registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    ahead->forget = GuestMemory::ForgetSerial();
-    ahead->indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     try {
-        if (draw.indexed) {
-            if (ahead->indexBytes > std::numeric_limits<std::size_t>::max()) return nullptr;
-            const auto bytes = static_cast<std::size_t>(ahead->indexBytes);
-            GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), bytes, draw.indexSize);
-            ahead->generation = GuestMemory::CollectWrites(draw.indexAddress, bytes);
-            if (ahead->generation == 0) return nullptr;
-            const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart);
-            const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(draw.indexAddress), bytes);
-            const auto highest = HighestDrawIndex(range, draw.indexSize, skipRestart);
-            if (!highest) return nullptr;
-            if (const auto zeroFrom = ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
-                const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
-                if (*highest >= limit && *highest - limit >= ZeroFetchSlack) return nullptr;
-            }
-            ahead->maxIndex = *highest;
-            ahead->indexRange = {draw.indexAddress, draw.indexAddress + ahead->indexBytes};
-        } else {
-            if (draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return nullptr;
-            ahead->maxIndex = draw.firstVertex + draw.indexCount - 1u;
-        }
         ahead->fragmentOutputs = CachedFragmentOutputs(context, shaders, state, ahead->validateMemoized, ahead->validateHit);
         ahead->shaderStages = PipelineStages(shaders);
         const auto& attributes = shaders.front().program->vertexAttributes;
@@ -3517,6 +3505,11 @@ std::shared_ptr<PreparedAhead> PrepareDrawAhead(const Context& context, const St
             if (context.vertexInputs != nullptr) ahead->retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
             if (ahead->retainedVertexInput == nullptr) ahead->vertexInput = BuildVertexInputLayout(context, attributes);
         }
+        const VertexInputLayout& vertexInput = ahead->retainedVertexInput != nullptr ? *ahead->retainedVertexInput : ahead->vertexInput;
+        ahead->setLayouts = DescribeSetLayouts(context, shaders);
+        ahead->attachmentLayout = RecordDraws() && !DrawTransitions() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        const auto masked = maskedState(state, ahead->fragmentOutputs);
+        ahead->pipeline = CachedPipeline(context, masked.has_value() ? *masked : state, vertexInput, ahead->setLayouts.View(), shaders, ahead->attachmentLayout);
     } catch (const std::exception&) {
         return nullptr;
     }
